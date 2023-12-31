@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"context"
-	"fmt"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -25,6 +24,7 @@ func init() {
 }
 
 type Record struct {
+	Key             string
 	Data            []byte
 	CacheStaleTime  time.Duration
 	BackupStaleTime time.Duration
@@ -73,7 +73,7 @@ type Keyable interface {
 	Key() string
 }
 
-type CallFunc[T Keyable] func(ctx context.Context, t T) (*Record, error)
+type CallFunc[T Keyable] func(ctx context.Context, keyables []T) ([]*Record, error)
 
 type BackoffOptions struct {
 	BackoffTimeout         time.Duration
@@ -98,17 +98,22 @@ func (s *Caller[T]) dataSource() DataSource {
 	return DefaultDataSource()
 }
 
-func (s *Caller[T]) Call(ctx context.Context, t T) ([]byte, error) {
-	persistentRecord, err := s.dataSource().Get(ctx, t.Key())
-	if err != nil {
-		// TODO: Add logger
-		persistentRecord = &PersistentRecord{Invalidated: true}
-	}
+func (s *Caller[T]) Call(ctx context.Context, keyables []T) (map[string][]byte, error) {
+	recordByKey := make(map[string]*PersistentRecord)
+	dataByKey := make(map[string][]byte)
+	for _, keyable := range keyables {
 
-	isCacheRecordValid := err == nil && !persistentRecord.IsCacheStale() && !persistentRecord.CacheInvalidated && !persistentRecord.Invalidated
-	isValidBackupData := err == nil && !persistentRecord.IsBackupStale() && !persistentRecord.Invalidated
-	if isCacheRecordValid {
-		return persistentRecord.Data, nil
+		persistentRecord, err := s.dataSource().Get(ctx, keyable.Key())
+		if err != nil {
+			// TODO: Add logger
+			persistentRecord = &PersistentRecord{Invalidated: true}
+		}
+
+		recordByKey[persistentRecord.Key] = persistentRecord
+		isCacheRecordValid := err == nil && !persistentRecord.IsCacheStale() && !persistentRecord.CacheInvalidated && !persistentRecord.Invalidated
+		if isCacheRecordValid {
+			dataByKey[persistentRecord.Key] = persistentRecord.Data
+		}
 	}
 
 	backoffTimeout := 10 * time.Second
@@ -136,35 +141,30 @@ func (s *Caller[T]) Call(ctx context.Context, t T) ([]byte, error) {
 		defaultBackupStaleTime = s.BackupStaleTime
 	}
 
-	errorStrategy := s.ErrorStrategy
-
 	backoffContext, cancel := context.WithTimeout(ctx, backoffTimeout)
 	defer cancel()
 
 	sleepDuration := backoffInitialDuraiton
 	var callError error
-	var record *Record
-	for {
-		record, callError = s.CallFunc(ctx, t)
-		if record == nil {
-			record = &Record{}
-		}
-
+	var records []*Record
+	var done bool
+	for !done {
+		records, callError = s.CallFunc(ctx, keyables)
 		cacheStaleTime := defaultCacheStaleTime
-		if record.CacheStaleTime != 0 {
-			cacheStaleTime = record.CacheStaleTime
-		}
+		for _, record := range records {
+			if record.CacheStaleTime != 0 {
+				cacheStaleTime = record.CacheStaleTime
+			}
 
-		backupStaleTime := defaultBackupStaleTime
-		if record.BackupStaleTime != 0 {
-			backupStaleTime = record.BackupStaleTime
-		}
+			backupStaleTime := defaultBackupStaleTime
+			if record.BackupStaleTime != 0 {
+				backupStaleTime = record.BackupStaleTime
+			}
 
-		if callError == nil {
-			defer func() {
+			if callError == nil {
 				timestamp := time.Now()
 				err := s.dataSource().Set(ctx, PersistentRecord{
-					Key:                 t.Key(),
+					Key:                 record.Key,
 					Data:                record.Data,
 					Timestamp:           timestamp,
 					CacheStaleDeadline:  timestamp.Add(cacheStaleTime),
@@ -175,40 +175,33 @@ func (s *Caller[T]) Call(ctx context.Context, t T) ([]byte, error) {
 				if err != nil {
 					// TODO: Add logger
 				}
-			}()
 
-			return record.Data, nil
+				dataByKey[record.Key] = record.Data
+			}
 		}
 
 		ticker := time.NewTicker(sleepDuration)
 		select {
 		case <-backoffContext.Done():
-			if errorStrategy == ErrorStrategyReturnNilError {
-				return nil, callError
-			}
-
-			backupData := persistentRecord.Data
-			var backupDataErr error
-			if !isValidBackupData {
-				backupData = nil
-				backupDataErr = fmt.Errorf(`missing backup data for key %q`, t.Key())
-			}
-
-			if errorStrategy == ErrorStrategyReturnBackupAndError {
-				return backupData, callError
-			}
-
-			return backupData, backupDataErr
+			done = true
 
 		case <-ticker.C:
 			sleepDuration *= time.Duration(backoffMultiplier)
 		}
 	}
-}
 
-func callWithBackoff[T Keyable](ctx context.Context, t T, callFunc CallFunc[T], backoffOptions BackoffOptions) (*Record, error) {
-	// TODO:
-	panic("unimplemented")
+	for _, keyable := range keyables {
+		_, ok := dataByKey[keyable.Key()]
+		if !ok {
+			record := recordByKey[keyable.Key()]
+			isValidBackupData := !record.IsBackupStale() && !record.Invalidated
+			if isValidBackupData {
+				dataByKey[keyable.Key()] = record.Data
+			}
+		}
+	}
+
+	return dataByKey, nil
 }
 
 func (s *Caller[T]) InvalidateKey(ctx context.Context, key string) error {
@@ -219,7 +212,7 @@ func (s *Caller[T]) InvalidateCacheKey(ctx context.Context, key string) error {
 	return s.dataSource().InvalidateCacheKey(ctx, key)
 }
 
-func SimpleCall[T Keyable](ctx context.Context, t T, callFunc CallFunc[T]) ([]byte, error) {
+func SimpleCall[T Keyable](ctx context.Context, keyables []T, callFunc CallFunc[T]) (map[string][]byte, error) {
 	stub := Caller[T]{CallFunc: callFunc}
-	return stub.Call(ctx, t)
+	return stub.Call(ctx, keyables)
 }
